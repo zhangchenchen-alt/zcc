@@ -29,6 +29,15 @@ def entropy_loss_sigmoid(pred):
     loss /= mask.sum() + 1e-10
     return loss
 
+
+
+def masked_pseudo_ce_loss(logits, gamma=0.9):
+    probs = torch.sigmoid(logits).detach()
+    pseudo = (probs >= 0.5).float()
+    mask = ((probs >= gamma) | (probs <= 1 - gamma)).float()
+    ce = F.binary_cross_entropy_with_logits(logits, pseudo, reduction='none')
+    return (ce * mask).sum() / mask.sum().clamp_min(1.0)
+
 class SPTTA_Online(BaseAdapter):
     def __init__(self, args):
         super(SPTTA_Online, self).__init__(args)
@@ -52,8 +61,9 @@ class SPTTA_Online(BaseAdapter):
                 for step in range(self.args.optim_steps):
                     self.all_steps += 1
                     output, bn_f, _, _ = self.model.online_network(data, training=True)
-                    loss_entropy_before = bn_loss(self.model.online_network, self.pretrained_params, bn_f)
-                    all_loss = loss_entropy_before
+                    loss_bn = bn_loss(self.model.online_network, self.pretrained_params, bn_f, alpha=self.args.alpha, i=self.args.layers, index=iter + 1, tau=self.args.bn_tau)
+                    loss_pseudo = masked_pseudo_ce_loss(output, gamma=self.args.pseudo_gamma)
+                    all_loss = loss_pseudo + self.args.bn_weight * loss_bn
                     print('step:{}, loss:{}'.format(step, all_loss.item()))
                     train_loss_list.append(all_loss.item())
                    
@@ -142,6 +152,16 @@ if __name__ == '__main__':
     parser.add_argument('--ema_decay', type=float, default=0.94, required=False,
                         help='ema decay.')
     parser.add_argument('--min_momentum_constant', type=float, default=0.01, required=False,help='min momentum constant.')
+    parser.add_argument('--alpha', type=float, default=0.01, required=False,
+                        help='alpha in BN loss.')
+    parser.add_argument('--layers', type=int, default=5, required=False,
+                        help='layers to calculate bn loss.')
+    parser.add_argument('--bn_weight', type=float, default=1.0, required=False,
+                        help='weight for BN alignment term.')
+    parser.add_argument('--bn_tau', type=float, default=50.0, required=False,
+                        help='temperature factor for BN warm-up.')
+    parser.add_argument('--pseudo_gamma', type=float, default=0.9, required=False,
+                        help='confidence threshold for pseudo-label selection.')
 
     args = parser.parse_args()
     adpater = SPTTA_Online(args)

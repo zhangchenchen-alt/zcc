@@ -62,6 +62,15 @@ LSIZEDistCentroid = ['Constrain_prior_w_self_entropy_loss',
                      'moment_fn':'soft_dist_centroid', 'lamb_consprior':1,
                      'power': 1, 'act':'sigmoid'}]
 
+
+
+def masked_pseudo_ce_loss(logits, gamma=0.9):
+    probs = torch.sigmoid(logits).detach()
+    pseudo = (probs >= 0.5).float()
+    mask = ((probs >= gamma) | (probs <= 1 - gamma)).float()
+    ce = F.binary_cross_entropy_with_logits(logits, pseudo, reduction='none')
+    return (ce * mask).sum() / mask.sum().clamp_min(1.0)
+
 class Offline_Adapter(BaseAdapter):
     def __init__(self, args):
         super(SPTTA_Offline, self).__init__(args)
@@ -160,11 +169,13 @@ class Offline_Adapter(BaseAdapter):
                                                     pin_memory=True,
                                                     collate_fn=collate_fn_ts)
 
-    def optimize_parameters(self, input, loss_fn=None):
+    def optimize_parameters(self, input, loss_fn=None, sample_index=None):
         if args.model == 'BN-Sta-TTA':
             self.optimizer.zero_grad()
             pred, bn_f, _, _ = self.model(input, training=True) 
-            loss = bn_loss(self.model, self.pretrained_params, bn_f)
+            bn_term = bn_loss(self.model, self.pretrained_params, bn_f, alpha=self.args.alpha, i=self.args.layers, index=sample_index, tau=self.args.bn_tau)
+            pseudo_ce_term = masked_pseudo_ce_loss(pred, gamma=self.args.pseudo_gamma)
+            loss = pseudo_ce_term + self.args.bn_weight * bn_term
             loss.backward()
             self.optimizer.step()
             return pred, loss
@@ -222,7 +233,7 @@ class Offline_Adapter(BaseAdapter):
         train_loss_list = list()
         for iter, batch in enumerate(self.tr_dataloader):
             data = torch.from_numpy(normalize_image(batch['data'])).cuda().to(dtype=torch.float32)
-            output, loss = self.optimize_parameters(data, loss_fn)
+            output, loss = self.optimize_parameters(data, loss_fn, sample_index=iter + 1)
             train_loss_list.append(loss.detach().cpu().numpy())
         mean_tr_loss = np.mean(train_loss_list)
         self.writer.add_scalar("Train Scalars/Learning Rate", lr, epoch)
@@ -303,6 +314,12 @@ if __name__ == '__main__':
                         required=False, help='pretrained model path.')
     parser.add_argument('--alpha', type=float, default=0.01, required=False,
                         help='alpha in BN loss.')
+    parser.add_argument('--bn_weight', type=float, default=1.0, required=False,
+                        help='weight for BN alignment term.')
+    parser.add_argument('--bn_tau', type=float, default=50.0, required=False,
+                        help='temperature factor for BN warm-up.')
+    parser.add_argument('--pseudo_gamma', type=float, default=0.9, required=False,
+                        help='confidence threshold for pseudo-label selection.')
     parser.add_argument('--layers', type=int, default=5, required=False,
                         help='layers to calculate bn loss.')
     parser.add_argument('--gamma', type=float, default=0.01, required=False,
